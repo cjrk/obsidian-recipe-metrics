@@ -1,11 +1,10 @@
 {
-	"id": "sample-plugin",
-	"name": "Sample Plugin",
-	"version": "1.0.0",
+	"id": "recipe-metrics",
+	"name": "Recipe Metrics",
+	"version": "0.0.0",
 	"minAppVersion": "0.15.0",
-	"description": "This is a sample plugin for Obsidian. This plugin demonstrates some of the capabilities of the Obsidian API.",
-	"author": "Obsidian",
-	"authorUrl": "https://obsidian.md",
-	"fundingUrl": "https://obsidian.md/pricing",
+	"description": "I have a recipe. I have a metric. Recipe Metric!",
+	"author": "Christian Jurke",
+	"authorUrl": "https://github.com/cjrk",
 	"isDesktopOnly": false
 }

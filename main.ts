@@ -1,4 +1,5 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { newNutritionLivePreview } from 'NutritionLivePreview';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
 
 // Remember to rename these classes and interfaces!
 
@@ -10,17 +11,312 @@ const DEFAULT_SETTINGS: MyPluginSettings = {
 	mySetting: 'default'
 }
 
+class Recipe {
+	amountInGram?: number;
+	conversionsToGram: Map<string, number>;
+	openConversions: Map<string, number>;
+	ingredients?: Map<string, { amount: number, unit: string }>;
+	nutrients?: Map<string, number>;
+}
+
+function getOr<K, V>(m: Map<K, V>, key: K, defaultValue: V): V {
+	if (m.has(key)) {
+		return m.get(key) as V;
+	} else {
+		return defaultValue;
+	}
+}
+
+function unify(s: string, aliasMap: Map<string, string>): string {
+	let base = aliasMap.get(s);
+	if (base !== undefined) {
+		return base;
+	} else {
+		return s;
+	}
+}
+
+function numberConv(sparam: string): number {
+	let s = sparam.trim();
+	if (s === '1/8') return 0.125
+	else if (s === '1/4') return 0.25
+	else if (s === '1/2') return 0.5
+	else return Number(s.replace(',', '.'));
+}
+
+function convertToGram(amount: number, unit: string, conversionTable: Map<string, number>): number {
+	if (unit === 'g') {
+		return amount;
+	} else if (conversionTable.has(unit)) {
+		let gramPerUnit = conversionTable.get(unit);
+		return (gramPerUnit as number) * amount;
+	} else {
+		console.error('unknown unit: ' + unit);
+		console.error(conversionTable);
+		return NaN;
+	}
+}
+
+function nutrientsForGrams(nutrients: Map<string, number>, baseGram: number, targetGram: number): Map<string, number> {
+	let kcal = getOr(nutrients, 'kcal', 0);
+	let kh = getOr(nutrients, 'kh', 0);
+	let fat = getOr(nutrients, 'fat', 0);
+	let prot = getOr(nutrients, 'prot', 0);
+	return new Map<string, number>([
+		['kcal', (kcal * targetGram) / baseGram],
+		['fat', (fat * targetGram) / baseGram],
+		['kh', (kh * targetGram) / baseGram],
+		['prot', (prot * targetGram) / baseGram]
+	]);
+}
+
+function emptyNutrients(): Map<string, number> {
+	return new Map<string, number>([
+		['kcal', 0],
+		['fat', 0],
+		['kh', 0],
+		['prot', 0]
+	]);
+}
+
+function NaNNutrients(): Map<string, number> {
+	return new Map<string, number>([
+		['kcal', NaN],
+		['fat', NaN],
+		['kh', NaN],
+		['prot', NaN]
+	]);
+}
+
 export default class MyPlugin extends Plugin {
 	settings: MyPluginSettings;
+	recipes: Map<string, Recipe>;
+	unitAliases: Map<string, string>;
+
+	unifyUnit(unit: string): string {
+		return unify(unit.trim(), this.unitAliases);
+	}
+
+	async readRecipeFromFile(file: TFile) {
+		let amountRE = /- Ergibt (?<amount>\d[\d,./]*) (?<unit>[\w öäüß]+)/gi;
+		let conversionRE = /-\s*(?<unit>[\w öäüß]+): (?<amount>\d[\d,.]*)\s*g/gi;
+		let ingredientRE = /-\s+(?<ingredient>[\w öäüß,]+) - (?<amount>\d[\d,./]*)\s*(?<unit>[\w öäüß]+)/gi;
+		// extract stuff
+		let md = await this.app.vault.cachedRead(file);
+		let name = file.basename;
+		let recipe = new Recipe();
+		// extract conversions
+		recipe.conversionsToGram = new Map<string, number>();
+		recipe.openConversions = new Map<string, number>();
+		let conversionMatches = [...md.matchAll(conversionRE)];
+		conversionMatches.forEach(cm => {
+			if (cm.groups !== undefined) {
+				recipe.conversionsToGram.set(this.unifyUnit(cm.groups['unit'].trim()), numberConv(cm.groups['amount'].trim()));
+			}
+		});
+		// extract amount
+		let amountMatch = [...md.matchAll(amountRE)].first();
+		if (amountMatch?.groups !== undefined) {
+			let amount = amountMatch.groups['amount'];
+			let unit = this.unifyUnit(amountMatch.groups['unit'].trim());
+			if (unit === 'g') {
+				recipe.amountInGram = numberConv(amount);
+			} else if (recipe.conversionsToGram.has(unit)) {
+				let gramPerUnit = recipe.conversionsToGram.get(unit);
+				recipe.amountInGram = numberConv(amount) * (gramPerUnit as number);
+			} else {
+				// console.error(`Can't parse amount for ${name}`);
+				// instead add open conversion
+				recipe.openConversions.set(unit, numberConv(amount));
+			}
+		}
+		// extract ingredients
+		recipe.ingredients = new Map<string, { amount: number, unit: string }>();
+		let ingredientMatches = [...md.matchAll(ingredientRE)];
+		ingredientMatches.forEach(m => {
+			if (m.groups !== undefined) {
+				(recipe.ingredients as Map<string, { amount: number, unit: string }>).set(m.groups['ingredient'].trim(), { amount: numberConv(m.groups['amount']), unit: this.unifyUnit(m.groups['unit'].trim()) });
+			}
+		});
+		// put in db
+		if (recipe.ingredients.size > 0) {
+			// console.log('adding' + name);
+			// console.log(recipe);
+			this.recipes.set(name, recipe);
+		}
+	}
+
+	async readRecipeFromTable(file: TFile) {
+		const recipeRE = /\|\s*(?<name>[\w öäüß,]+)\s*\|\s*(?<kcal>\d[\d,.]*)\s*\|\s*(?<fat>\d[\d,.]*)\s*\|\s*(?<kh>\d[\d,.]*)\s*\|\s*(?<prot>\d[\d,.]*)\s*\|\s*(?<units>.*?)\s*\|/gi;
+		const unitRE = /(?<unit>[\w öäüß]+?):\s?(?<gram>\d[\d,.]*)/gi;
+		let md = await this.app.vault.cachedRead(file);
+		
+		// extract recipes
+		let recipeMatches = [...md.matchAll(recipeRE)];
+		recipeMatches.forEach(m => {
+			if (m.groups !== undefined) {
+				let name = m.groups['name'].trim();
+				let recipe = new Recipe();
+				recipe.amountInGram = 100;
+				recipe.nutrients = new Map<string, number>();
+				recipe.nutrients.set('kcal', numberConv(m.groups['kcal']));
+				recipe.nutrients.set('fat', numberConv(m.groups['fat']));
+				recipe.nutrients.set('kh', numberConv(m.groups['kh']));
+				recipe.nutrients.set('prot', numberConv(m.groups['prot']));
+				let units = m.groups['units'].trim();
+				let unitMatches = [...units.matchAll(unitRE)];
+				recipe.conversionsToGram = new Map<string, number>();
+				recipe.openConversions = new Map<string, number>();
+				unitMatches.forEach(m => {
+					if (m.groups !== undefined) {
+						recipe.conversionsToGram.set(this.unifyUnit(m.groups['unit'].trim()), numberConv(m.groups['gram']));
+					}
+				});
+				if (recipe.nutrients.size > 0) {
+					this.recipes.set(name, recipe);
+				}
+			}
+		});
+	}
+
+	parseIngredient(text:string) : { name:string, amount:number, unit:string } | undefined {
+		let ingredientRE = /(?<ingredient>[\w öäüß,]+) - (?<amount>\d[\d,./]*)\s*(?<unit>[\w öäüß]+)/i;
+		let m = text.match(ingredientRE);
+		if (m?.groups) {
+			return {
+				name: m.groups['ingredient'].trim(),
+				amount: numberConv(m.groups['amount']),
+				unit: this.unifyUnit(m.groups['unit'].trim())
+			}
+		}
+	}
+
+	calculateNutrients(name: string, amount: number, unit: string): Map<string, number> {
+		// load recipe
+		let recipe = this.recipes.get(name);
+		if (recipe === undefined) {
+			// console.error(`Can't find ${name} in recipes`)
+			// console.error(this.recipes)
+			return NaNNutrients();
+		}
+		// if recipe has no nutrients but ingredients
+		// - calculate nutrients from ingredients
+		if (recipe.nutrients === undefined && recipe.ingredients !== undefined) {
+			let kcal = 0;
+			let fat = 0;
+			let kh = 0;
+			let prot = 0;
+			let calculatedWeight = 0;
+			recipe.ingredients.forEach(({ amount, unit }, name) => {
+				if (this.recipes.get(name)) {
+					let nutrients = this.calculateNutrients(name, amount, unit);
+					kcal += getOr(nutrients, 'kcal', 0);
+					fat += getOr(nutrients, 'fat', 0);
+					kh += getOr(nutrients, 'kh', 0);
+					prot += getOr(nutrients, 'prot', 0);
+					calculatedWeight += convertToGram(amount, unit, this.recipes.get(name)?.conversionsToGram as Map<string, number>);
+				}
+			});
+			let calculatedNutrients = new Map<string, number>();
+			calculatedNutrients.set('kcal', kcal);
+			calculatedNutrients.set('fat', fat);
+			calculatedNutrients.set('kh', kh);
+			calculatedNutrients.set('prot', prot);
+			recipe.nutrients = calculatedNutrients;
+			if (recipe.amountInGram === undefined) {
+				recipe.amountInGram = calculatedWeight;
+			}
+			recipe.openConversions.forEach((amount, unit) => {
+				if (!recipe?.conversionsToGram.has(unit)) {
+					recipe?.conversionsToGram.set(unit, (recipe.amountInGram as number) / amount)
+				}
+			});
+			if (!recipe?.conversionsToGram.has('Portion')) {
+				recipe?.conversionsToGram.set('Portion', (recipe.amountInGram as number))
+			}
+		}
+		// convert nutritions for amount
+		let amountInGram = convertToGram(amount, unit, recipe.conversionsToGram);
+		let convertedNutrients = nutrientsForGrams(recipe.nutrients as Map<string, number>, recipe.amountInGram as number, amountInGram);
+		return convertedNutrients;
+	}
+
+	async updateRecipes() {
+		this.recipes = new Map<string, Recipe>();
+		await this.readRecipeFromTable(this.app.vault.getAbstractFileByPath('Rezepte/Ingredients.md') as TFile)
+			.then(() => {
+				return this.app.vault.getMarkdownFiles();
+			})
+			.then(files => {
+				return Promise.all(files.map(it => this.readRecipeFromFile(it)));
+			});
+	}
 
 	async onload() {
+		console.log('loading recipe-metrics')
 		await this.loadSettings();
+		this.recipes = new Map<string, Recipe>();
+		this.unitAliases = new Map<string, string>([
+			['Portionen', 'Portion'],
+			['Zehen', 'Zehe'],
+			['Dosen', 'Dose'],
+			['Tassen', 'Tasse'],
+		]);
+
+		
+		this.app.workspace.onLayoutReady(() => {
+			this.updateRecipes();
+		});
+
+		this.registerEvent(this.app.vault.on('modify', (f) => {
+			this.updateRecipes();
+		}));
+
+		this.registerEvent(this.app.vault.on('delete', (f) => {
+			this.updateRecipes();
+		}));
+
+		this.registerEvent(this.app.vault.on('rename', (f) => {
+			this.updateRecipes();
+		}));
 
 		// This creates an icon in the left ribbon.
 		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
 			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+			// this.readRecipeFromTable(this.app.vault.getAbstractFileByPath('Rezepte/Ingredients.md') as TFile)
+			// 	.then(() => {
+			// 		return this.app.vault.getMarkdownFiles();
+			// 	})
+			// 	.then(files => {
+			// 		return Promise.all(files.map(it => this.readRecipeFromFile(it)));
+			// 	})
+			this.updateRecipes()
+				.then(() => {
+					let currentFile = this.app.workspace.getActiveFile()?.basename;
+					if (currentFile) {
+						console.log(currentFile);
+						console.log(this.calculateNutrients(currentFile, 1, 'Portion'));
+					}
+				})
+				.then(() => {
+					console.log(this.recipes);
+				})
+				.then(() => {
+					new Notice('Hello Plugin');
+				})
 		});
+
+		this.registerEditorExtension(newNutritionLivePreview(this));
+
+		// console.log("BLAHHHHHHHH")
+		// this.registerMarkdownPostProcessor((element, context) => {
+		// 	console.log('HEFTIG!')
+		// 	let listElements = element.querySelectorAll('code');
+		// 	listElements.forEach(elem => {
+		// 		context.addChild(new NutritionPill(elem, 'lol'));
+		// 	})
+		// })
+
 		// Perform additional things with the ribbon
 		ribbonIconEl.addClass('my-plugin-ribbon-class');
 
@@ -70,12 +366,12 @@ export default class MyPlugin extends Plugin {
 
 		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
 		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
+		// this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
+		// 	console.log('click', evt);
+		// });
 
 		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		// this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
 	}
 
 	onunload() {
@@ -97,12 +393,12 @@ class SampleModal extends Modal {
 	}
 
 	onOpen() {
-		const {contentEl} = this;
+		const { contentEl } = this;
 		contentEl.setText('Woah!');
 	}
 
 	onClose() {
-		const {contentEl} = this;
+		const { contentEl } = this;
 		contentEl.empty();
 	}
 }
@@ -116,7 +412,7 @@ class SampleSettingTab extends PluginSettingTab {
 	}
 
 	display(): void {
-		const {containerEl} = this;
+		const { containerEl } = this;
 
 		containerEl.empty();
 
